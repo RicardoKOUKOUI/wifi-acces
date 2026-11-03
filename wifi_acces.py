@@ -241,8 +241,14 @@ class AppWindow(Gtk.ApplicationWindow):
 
         self.scan_btn = Gtk.Button(label="Scanner le Wi-Fi")
         self.scan_btn.get_style_context().add_class("suggested-action")
-        self.scan_btn.connect("clicked", lambda *_: self.start_scan())
+        self.scan_btn.connect("clicked", lambda *_: self.start_scan(False))
         header.pack_end(self.scan_btn)
+
+        self.deep_btn = Gtk.Button(label="Scan profond")
+        self.deep_btn.get_style_context().add_class("flat-ghost")
+        self.deep_btn.set_tooltip_text("Demande le mot de passe Linux pour voir encore plus d’appareils")
+        self.deep_btn.connect("clicked", lambda *_: self.start_scan(True))
+        header.pack_end(self.deep_btn)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         root.set_margin_top(16)
@@ -313,7 +319,7 @@ class AppWindow(Gtk.ApplicationWindow):
 
     def on_key(self, _widget, event) -> bool:
         if event.keyval in (Gdk.KEY_F5,):
-            self.start_scan()
+            self.start_scan(False)
             return True
         return False
 
@@ -350,18 +356,18 @@ class AppWindow(Gtk.ApplicationWindow):
         self.message.set_text(data.get("message") or "")
         self.bar.set_fraction((data.get("progress") or 0) / 100)
         self.scan_btn.set_sensitive(not self.scanning)
+        self.deep_btn.set_sensitive(not self.scanning)
         self.refresh_btn.set_sensitive(not self.scanning)
         has_box = bool(self.info.get("gateway"))
         self.box_btn.set_sensitive(has_box)
         self.kick_btn.set_sensitive(has_box)
 
-        if self.info.get("shared"):
-            self.warn.set_text(
-                f"Réseau large ({self.info.get('network')}) : le scan couvre TOUTES les adresses, "
-                "sans exception. Sur un Wi-Fi d’opérateur tu peux aussi voir des voisins."
-            )
-        else:
-            self.warn.set_text("")
+        count = len(self.devices)
+        self.warn.set_text(
+            f"Ce PC voit {count} appareil(s) qui répondent. "
+            "S’il y en a 300, le reste est dans la box ou ne répond pas. "
+            "Clique Scan profond (mot de passe Linux) ou Ouvrir la box → appareils connectés."
+        )
 
         for child in list(self.listbox.get_children()):
             self.listbox.remove(child)
@@ -375,16 +381,17 @@ class AppWindow(Gtk.ApplicationWindow):
                 self.listbox.add(DeviceRow(device))
         self.listbox.show_all()
 
-    def start_scan(self) -> None:
+    def start_scan(self, deep: bool = False) -> None:
         if self.scanning:
             return
         self.scanning = True
         self.scan_btn.set_sensitive(False)
+        self.deep_btn.set_sensitive(False)
         self.refresh_btn.set_sensitive(False)
-        self.message.set_text("Scan en cours…")
+        self.message.set_text("Scan profond en cours…" if deep else "Scan en cours…")
 
         def worker() -> None:
-            scanner.scan_network(lambda data: GLib.idle_add(self.apply_state, data))
+            scanner.scan_network(lambda data: GLib.idle_add(self.apply_state, data), deep=deep)
 
         threading.Thread(target=worker, daemon=True).start()
 

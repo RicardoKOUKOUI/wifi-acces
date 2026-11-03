@@ -15,6 +15,7 @@ from pathlib import Path
 
 OUI_PATH = Path("/usr/share/nmap/nmap-mac-prefixes")
 SAVE_PATH = Path(__file__).resolve().parent / "appareils_connus.json"
+HIST_PATH = Path(__file__).resolve().parent / "appareils_historique.json"
 
 vendors: dict[str, str] = {}
 
@@ -240,8 +241,28 @@ def mdns_names() -> dict[str, str]:
     return names
 
 
-def nmap_hosts(network: str) -> dict[str, dict]:
+def parse_nmap_xml(xml: str) -> dict[str, dict]:
     found: dict[str, dict] = {}
+    if not xml.strip():
+        return found
+    for block in re.findall(r"<host\b.*?</host>", xml, re.S):
+        if 'state="up"' not in block:
+            continue
+        ip_match = re.search(r'addr="(\d+\.\d+\.\d+\.\d+)" addrtype="ipv4"', block)
+        mac_match = re.search(r'addr="([0-9A-Fa-f:]{17})" addrtype="mac"', block)
+        vendor_match = re.search(r'addrtype="mac"[^>]*vendor="([^"]*)"', block)
+        if not ip_match:
+            continue
+        ip = ip_match.group(1)
+        mac = mac_match.group(1).lower() if mac_match else ""
+        if not mac:
+            continue
+        vendor = vendor_match.group(1) if vendor_match else ""
+        found[ip] = {"ip": ip, "mac": mac, "status": "en ligne", "nmap_vendor": vendor}
+    return found
+
+
+def nmap_hosts(network: str) -> dict[str, dict]:
     xml = run(
         [
             "nmap",
@@ -260,23 +281,27 @@ def nmap_hosts(network: str) -> dict[str, dict]:
         ],
         timeout=90,
     )
-    if not xml.strip():
-        return found
-    for block in re.findall(r"<host\b.*?</host>", xml, re.S):
-        if 'state="up"' not in block:
-            continue
-        ip_match = re.search(r'addr="(\d+\.\d+\.\d+\.\d+)" addrtype="ipv4"', block)
-        mac_match = re.search(r'addr="([0-9A-Fa-f:]{17})" addrtype="mac"', block)
-        vendor_match = re.search(r'addrtype="mac"[^>]*vendor="([^"]*)"', block)
-        if not ip_match:
-            continue
-        ip = ip_match.group(1)
-        mac = mac_match.group(1).lower() if mac_match else ""
-        if not mac:
-            continue
-        vendor = vendor_match.group(1) if vendor_match else ""
-        found[ip] = {"ip": ip, "mac": mac, "status": "en ligne", "nmap_vendor": vendor}
-    return found
+    return parse_nmap_xml(xml)
+
+
+def nmap_hosts_privileged(network: str) -> dict[str, dict]:
+    xml = run(
+        [
+            "pkexec",
+            "nmap",
+            "-sn",
+            "-PR",
+            "-n",
+            "-T5",
+            "--min-rate",
+            "1000",
+            "-oX",
+            "-",
+            network,
+        ],
+        timeout=180,
+    )
+    return parse_nmap_xml(xml)
 
 
 def ping_sweep(ips: list[str], on_tick=None) -> None:
@@ -314,13 +339,9 @@ def parse_arp(iface: str) -> dict[str, dict]:
         mac_match = re.search(r"lladdr ([0-9a-f:]{17})", line, re.I)
         if not ip_match or not mac_match:
             continue
-        status = "hors ligne"
+        status = "vu récemment"
         if any(flag in line for flag in ("REACHABLE", "DELAY", "PROBE", "PERMANENT")):
             status = "en ligne"
-        elif "STALE" in line:
-            status = "vu récemment"
-        else:
-            continue
         ip = ip_match.group(1)
         found[ip] = {
             "ip": ip,
@@ -328,6 +349,74 @@ def parse_arp(iface: str) -> dict[str, dict]:
             "status": status,
         }
     return found
+
+
+def harvest_arp(into: dict[str, dict], iface: str) -> None:
+    rank = {"en ligne": 0, "vu récemment": 1, "hors ligne": 2}
+    for ip, row in parse_arp(iface).items():
+        prev = into.get(ip)
+        if prev is None or rank.get(row["status"], 9) <= rank.get(prev["status"], 9):
+            into[ip] = row
+
+
+def harvest_ipv6(into: dict[str, dict], iface: str) -> None:
+    run(["ping", "-6", "-c", "2", "-W", "1", "-I", iface, "ff02::1"], timeout=5)
+    known_macs = {row["mac"] for row in into.values() if row.get("mac")}
+    output = run(["ip", "-6", "neigh", "show"])
+    for line in output.splitlines():
+        if iface and f"dev {iface}" not in line:
+            continue
+        ip_match = re.match(r"(\S+)", line)
+        mac_match = re.search(r"lladdr ([0-9a-f:]{17})", line, re.I)
+        if not ip_match or not mac_match:
+            continue
+        mac = mac_match.group(1).lower()
+        if mac in known_macs:
+            continue
+        ip = ip_match.group(1)
+        status = "en ligne" if "REACHABLE" in line else "vu récemment"
+        into[ip] = {"ip": ip, "mac": mac, "status": status}
+        known_macs.add(mac)
+
+
+def load_history() -> dict[str, dict]:
+    if not HIST_PATH.exists():
+        return {}
+    try:
+        data = json.loads(HIST_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_history(arp: dict[str, dict]) -> None:
+    hist = load_history()
+    for row in arp.values():
+        mac = row.get("mac", "")
+        if not mac:
+            continue
+        hist[mac] = {
+            "ip": row["ip"],
+            "mac": mac,
+            "status": "vu récemment",
+            "nmap_vendor": row.get("nmap_vendor", ""),
+        }
+    HIST_PATH.write_text(json.dumps(hist, ensure_ascii=False, indent=2))
+
+
+def merge_history(arp: dict[str, dict]) -> None:
+    known_macs = {row["mac"] for row in arp.values() if row.get("mac")}
+    known_ips = set(arp)
+    for mac, row in load_history().items():
+        ip = row.get("ip") or mac
+        if mac in known_macs or ip in known_ips:
+            continue
+        arp[ip] = {
+            "ip": ip,
+            "mac": mac,
+            "status": "vu récemment",
+            "nmap_vendor": row.get("nmap_vendor", ""),
+        }
 
 
 def hostname_of(ip: str) -> str:
@@ -436,7 +525,7 @@ def scan_targets(info: dict) -> list[str]:
     return targets
 
 
-def scan_network(on_progress=None) -> dict:
+def scan_network(on_progress=None, deep: bool = False) -> dict:
     global vendors
     if not vendors:
         vendors = load_vendors()
@@ -466,51 +555,51 @@ def scan_network(on_progress=None) -> dict:
             on_progress(result)
         return result
 
-    seen = parse_arp(info["iface"])
+    iface = info["iface"]
+    seen: dict[str, dict] = {}
+    harvest_arp(seen, iface)
     devices = build_devices(info, seen, resolve_names=False)
-    progress(6, f"Scan complet de {info.get('network')} ({info.get('host_count')} adresses)…", info, devices)
+    progress(4, f"Scan de TOUT {info.get('network')} ({info.get('host_count')} adresses)…", info, devices)
 
-    network = info.get("scan_network") or info.get("cidr")
-    nmap_found: dict[str, dict] = {}
-    if network:
-        progress(12, "Découverte de tous les appareils (nmap)…", info, devices)
-        nmap_found = nmap_hosts(network)
-        progress(40, f"{len(nmap_found)} hôte(s) nmap, ping de tout le réseau…", info, devices)
+    if info.get("cidr"):
+        net = ipaddress.IPv4Network(info["cidr"], strict=False)
+        run(["ping", "-b", "-c", "2", "-W", "1", str(net.broadcast_address)], timeout=4)
+        harvest_arp(seen, iface)
 
     targets = scan_targets(info)
     total = max(len(targets), 1)
-
-    def ping_tick(done: int, all_count: int) -> None:
-        progress(40 + int(done / all_count * 20), f"Ping de toutes les IP… {done}/{all_count}", info, devices)
-
-    ping_sweep(targets, ping_tick)
+    batch_size = 64
     done = 0
-    with ThreadPoolExecutor(max_workers=256) as pool:
-        futures = [pool.submit(probe, ip) for ip in targets]
-        for future in as_completed(futures):
-            future.result()
-            done += 1
-            if done % 200 == 0 or done == total:
-                progress(60 + int(done / total * 20), f"Scan de toutes les IP… {done}/{total}", info, devices)
+    for start in range(0, len(targets), batch_size):
+        batch = targets[start : start + batch_size]
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            list(pool.map(probe, batch))
+            list(pool.map(lambda ip: run(["ping", "-c", "1", "-W", "1", ip], 1.6), batch))
+        harvest_arp(seen, iface)
+        done = min(start + batch_size, total)
+        pct = 6 + int(done / total * 78)
+        devices = build_devices(info, seen, resolve_names=False)
+        progress(pct, f"Scan de toutes les IP… {done}/{total} — {len(seen)} trouvé(s)", info, devices)
 
-    time.sleep(1.4)
-    arp = dict(seen)
-    fresh = parse_arp(info["iface"])
-    for ip, row in fresh.items():
-        arp[ip] = row
-    for ip, row in nmap_found.items():
-        if ip not in arp:
-            arp[ip] = row
-        else:
-            arp[ip]["status"] = "en ligne"
-            if row.get("nmap_vendor"):
-                arp[ip]["nmap_vendor"] = row["nmap_vendor"]
+    time.sleep(0.8)
+    harvest_arp(seen, iface)
+    harvest_ipv6(seen, iface)
+    network = info.get("scan_network") or info.get("cidr")
+    if deep and network:
+        progress(85, "Scan profond : entre le mot de passe Linux si demandé…", info, build_devices(info, seen, False))
+        extra = nmap_hosts_privileged(network)
+        for ip, row in extra.items():
+            seen[ip] = row
+    merge_history(seen)
+    save_history(seen)
+    arp = seen
     info["mdns"] = mdns_names()
-    progress(88, "Identification (téléphone, PC, marque)…", info, build_devices(info, arp, False))
+    progress(88, f"Identification de {len(arp)} appareil(s)…", info, build_devices(info, arp, False))
     devices = build_devices(info, arp, resolve_names=True)
     online = sum(1 for d in devices if d["status"] == "en ligne")
     unknown = sum(1 for d in devices if not d["known"])
-    message = f"{len(devices)} appareil(s), {online} en ligne, {unknown} inconnu(s)"
+    macs = {d["mac"] for d in devices if d.get("mac")}
+    message = f"{len(devices)} appareil(s), {len(macs)} MAC, {online} en ligne, {unknown} inconnu(s)"
     result = {
         "scanning": False,
         "progress": 100,

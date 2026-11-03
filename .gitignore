@@ -5,3 +5,4 @@ venv/
 .env
 .env.*
 appareils_connus.json
+appareils_historique.json
