@@ -10,6 +10,7 @@ from pathlib import Path
 
 import gi
 
+gi.require_version("Gdk", "3.0")
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango
 
@@ -57,6 +58,14 @@ button.flat-ghost {
   border-radius: 999px;
   padding: 10px 16px;
 }
+button.danger {
+  background: #d45b4a;
+  color: #fff8f6;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 10px 16px;
+  border: 0;
+}
 .tag {
   background-color: #223046;
   color: #7aa7ff;
@@ -89,6 +98,20 @@ def load_css() -> None:
 def ellipsize(label: Gtk.Label) -> None:
     label.set_ellipsize(Pango.EllipsizeMode.END)
     label.set_xalign(0)
+
+
+def copy_text(text: str) -> None:
+    clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    clipboard.set_text(text, -1)
+    clipboard.store()
+
+
+def wrapped_label(text: str, css: str = "hint") -> Gtk.Label:
+    label = Gtk.Label(label=text)
+    label.set_line_wrap(True)
+    label.set_xalign(0)
+    label.get_style_context().add_class(css)
+    return label
 
 
 class DeviceRow(Gtk.ListBoxRow):
@@ -137,18 +160,21 @@ class DeviceRow(Gtk.ListBoxRow):
             tag = Gtk.Label(label="BOX")
             tag.get_style_context().add_class("tag")
             right.pack_start(tag, False, False, 0)
-        elif not device.get("known"):
-            tag = Gtk.Label(label="INCONNU")
-            tag.get_style_context().add_class("tag")
-            tag.get_style_context().add_class("tag-warn")
-            right.pack_start(tag, False, False, 0)
-            btn = Gtk.Button(label="Nommer")
-            btn.connect("clicked", self.on_rename)
-            right.pack_start(btn, False, False, 0)
         else:
-            btn = Gtk.Button(label="Renommer")
-            btn.connect("clicked", self.on_rename)
-            right.pack_start(btn, False, False, 0)
+            if not device.get("known"):
+                tag = Gtk.Label(label="INCONNU")
+                tag.get_style_context().add_class("tag")
+                tag.get_style_context().add_class("tag-warn")
+                right.pack_start(tag, False, False, 0)
+            actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            name_btn = Gtk.Button(label="Nommer")
+            name_btn.connect("clicked", self.on_rename)
+            block_btn = Gtk.Button(label="Bloquer")
+            block_btn.get_style_context().add_class("danger")
+            block_btn.connect("clicked", self.on_block)
+            actions.pack_start(name_btn, False, False, 0)
+            actions.pack_start(block_btn, False, False, 0)
+            right.pack_start(actions, False, False, 0)
 
         box.pack_start(dot, False, False, 0)
         box.pack_start(text, True, True, 0)
@@ -159,6 +185,11 @@ class DeviceRow(Gtk.ListBoxRow):
         window = self.get_toplevel()
         if isinstance(window, AppWindow):
             window.rename_device(self.device)
+
+    def on_block(self, _button) -> None:
+        window = self.get_toplevel()
+        if isinstance(window, AppWindow):
+            window.block_device(self.device)
 
 
 class AppWindow(Gtk.ApplicationWindow):
@@ -175,7 +206,7 @@ class AppWindow(Gtk.ApplicationWindow):
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
         header.set_title("Wi-Fi Accès")
-        header.set_subtitle("Qui est connecté à ton Wi-Fi")
+        header.set_subtitle("Voir, nommer et bloquer les appareils")
         self.set_titlebar(header)
 
         self.refresh_btn = Gtk.Button(label="Actualiser")
@@ -183,9 +214,15 @@ class AppWindow(Gtk.ApplicationWindow):
         self.refresh_btn.connect("clicked", lambda *_: self.refresh_snapshot())
         header.pack_start(self.refresh_btn)
 
+        self.kick_btn = Gtk.Button(label="Virer tout le monde")
+        self.kick_btn.get_style_context().add_class("danger")
+        self.kick_btn.set_tooltip_text("Change le mot de passe Wi-Fi dans la box : les voisins sont coupés")
+        self.kick_btn.connect("clicked", lambda *_: self.kick_everyone())
+        header.pack_end(self.kick_btn)
+
         self.box_btn = Gtk.Button(label="Ouvrir la box")
         self.box_btn.get_style_context().add_class("flat-ghost")
-        self.box_btn.set_tooltip_text("Ouvre la page de ta box pour changer le mot de passe Wi-Fi")
+        self.box_btn.set_tooltip_text("Ouvre la page de ta box")
         self.box_btn.connect("clicked", self.open_router)
         header.pack_end(self.box_btn)
 
@@ -236,13 +273,10 @@ class AppWindow(Gtk.ApplicationWindow):
         scroll.add(self.listbox)
         root.pack_start(scroll, True, True, 0)
 
-        hint = Gtk.Label(
-            label="Pour vraiment régler le problème : ouvre la box, change le mot de passe Wi-Fi, "
-            "et donne-le seulement aux personnes que tu veux."
+        hint = wrapped_label(
+            "Bloquer un appareil ouvre la box avec son adresse MAC. "
+            "Pour couper tous les voisins d’un coup : Virer tout le monde, puis change le mot de passe Wi-Fi."
         )
-        hint.set_line_wrap(True)
-        hint.set_xalign(0)
-        hint.get_style_context().add_class("hint")
         root.pack_start(hint, False, False, 0)
 
         self.add(root)
@@ -304,7 +338,9 @@ class AppWindow(Gtk.ApplicationWindow):
         self.bar.set_fraction((data.get("progress") or 0) / 100)
         self.scan_btn.set_sensitive(not self.scanning)
         self.refresh_btn.set_sensitive(not self.scanning)
-        self.box_btn.set_sensitive(bool(self.info.get("gateway")))
+        has_box = bool(self.info.get("gateway"))
+        self.box_btn.set_sensitive(has_box)
+        self.kick_btn.set_sensitive(has_box)
 
         if self.info.get("shared"):
             self.warn.set_text(
@@ -347,6 +383,88 @@ class AppWindow(Gtk.ApplicationWindow):
             gateway = self.info.get("gateway")
         if gateway:
             webbrowser.open(f"http://{gateway}")
+
+    def block_device(self, device: dict) -> None:
+        mac = device.get("mac", "")
+        copy_text(mac)
+        title = device.get("name") or device.get("hostname") or "Appareil inconnu"
+        dialog = Gtk.Dialog(title="Bloquer cet appareil", transient_for=self, modal=True)
+        dialog.add_buttons("Fermer", Gtk.ResponseType.CLOSE)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        for margin in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{margin}")(14)
+        box.pack_start(wrapped_label(f"{title}\n{device.get('vendor', '')}  ·  {mac}", "name"), False, False, 0)
+        box.pack_start(
+            wrapped_label(
+                "L’adresse MAC est copiée. Un ordinateur ne peut pas virer un téléphone tout seul : "
+                "c’est la box qui décide. Colle cette adresse dans la box, ou change le mot de passe."
+            ),
+            False,
+            False,
+            0,
+        )
+        box.pack_start(
+            wrapped_label(
+                "1. Clique Ouvrir la box\n"
+                "2. Connecte-toi (identifiants sur l’étiquette de la box)\n"
+                "3. Cherche Appareils connectés, Filtrage MAC ou Liste noire\n"
+                "4. Colle l’adresse MAC et bloque l’appareil\n"
+                "5. Pour tout le monde d’un coup : Virer tout le monde"
+            ),
+            False,
+            False,
+            0,
+        )
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        copy_btn = Gtk.Button(label="Copier l’adresse MAC")
+        copy_btn.connect("clicked", lambda *_: copy_text(mac))
+        open_btn = Gtk.Button(label="Ouvrir la box")
+        open_btn.get_style_context().add_class("suggested-action")
+        open_btn.connect("clicked", self.open_router)
+        actions.pack_start(copy_btn, False, False, 0)
+        actions.pack_start(open_btn, False, False, 0)
+        box.pack_start(actions, False, False, 8)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    def kick_everyone(self, _button=None) -> None:
+        dialog = Gtk.Dialog(title="Virer tout le monde", transient_for=self, modal=True)
+        dialog.add_buttons("Fermer", Gtk.ResponseType.CLOSE)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        for margin in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{margin}")(14)
+        box.pack_start(
+            wrapped_label(
+                "C’est la seule méthode qui marche vraiment. "
+                "Dès que tu changes le mot de passe Wi-Fi, les voisins sont coupés. "
+                "Donne le nouveau code seulement à la famille."
+            ),
+            False,
+            False,
+            0,
+        )
+        box.pack_start(
+            wrapped_label(
+                "1. Clique Ouvrir la box (ça s’ouvre dans le navigateur)\n"
+                "2. Connecte-toi. Identifiant et mot de passe sont souvent sur une étiquette sous la box\n"
+                "3. Cherche Wi-Fi, WLAN ou Sans fil\n"
+                "4. Change le mot de passe Wi-Fi\n"
+                "5. Enregistre, puis reconnecte tes appareils avec le nouveau code"
+            ),
+            False,
+            False,
+            0,
+        )
+        open_btn = Gtk.Button(label="Ouvrir la box maintenant")
+        open_btn.get_style_context().add_class("suggested-action")
+        open_btn.connect("clicked", self.open_router)
+        box.pack_start(open_btn, False, False, 8)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
 
     def rename_device(self, device: dict) -> None:
         dialog = Gtk.Dialog(title="Nommer l’appareil", transient_for=self, modal=True)

@@ -1,12 +1,14 @@
 # Wi-Fi Accès
 
-Logiciel **open source** pour Linux. Il liste les appareils connectés à ton Wi-Fi, te laisse leur donner un nom, et ouvre la page de ta box pour changer le mot de passe.
+Logiciel **open source** (licence [MIT](LICENSE)) pour Linux.
 
-Licence : [MIT](LICENSE)
+Ton cousin a donné le code Wi-Fi aux voisins, le réseau est lent : cet outil montre **qui est connecté**. Tu peux **nommer** un appareil, **bloquer** (ça ouvre la box avec l’adresse MAC), ou **virer tout le monde** en changeant le mot de passe Wi-Fi.
+
+Ça marche chez toi **et chez maman** : clone le même dépôt, installe, scanne, change le mot de passe.
 
 ## Installer en clonant le dépôt
 
-Sur Linux (Debian, Ubuntu, Parrot, Linux Mint, Fedora, etc.) :
+Sur l’ordinateur Linux (chez toi ou chez maman) :
 
 ```bash
 git clone https://github.com/RicardoKOUKOUI/wifi-acces.git
@@ -15,34 +17,42 @@ chmod +x install-linux.sh
 ./install-linux.sh
 ```
 
-Ensuite cherche **Wi-Fi Accès** dans le menu des applications, ou lance :
+Ensuite cherche **Wi-Fi Accès** dans le menu, ou tape :
 
 ```bash
 wifi-acces
 ```
 
-### Dépendances
+Si la commande n’est pas trouvée, ferme le terminal, rouvre-le, ou lance :
 
-Si l’appli ne s’ouvre pas, installe GTK et Python :
+```bash
+python3 wifi_acces.py
+```
+
+Si ça ne s’ouvre pas :
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-gi gir1.2-gtk-3.0 network-manager
+sudo apt install python3 python3-gi gir1.2-gtk-3.0 network-manager git
 ```
 
-Sur Fedora :
+Puis relance `./install-linux.sh`.
+
+### Fedora
 
 ```bash
-sudo dnf install python3 python3-gobject gtk3 NetworkManager
+sudo dnf install python3 python3-gobject gtk3 NetworkManager git
 ```
 
-## Utilisation
+## Comment l’utiliser
 
 1. Clique **Scanner le Wi-Fi**
-2. Les appareils inconnus sont marqués **INCONNU** — tu peux les nommer
-3. Clique **Ouvrir la box** pour changer le mot de passe Wi-Fi (c’est ça qui coupe vraiment les gens en trop)
+2. Tu vois les appareils : **TOI**, **BOX**, et les **INCONNUS** (souvent les voisins)
+3. **Nommer** : ex. « téléphone de maman »
+4. **Bloquer** : copie l’adresse MAC et ouvre la box pour le mettre en liste noire
+5. **Virer tout le monde** : ouvre la box, change le **mot de passe Wi-Fi**, donne le nouveau code seulement à la famille
 
-Sur un Wi-Fi d’opérateur ou d’immeuble, tu peux aussi voir des appareils qui ne sont pas chez toi.
+C’est le changement de mot de passe qui coupe vraiment les voisins. Tant qu’ils ont l’ancien code, ils peuvent revenir.
 
 ## Lancer sans installer
 
@@ -54,4 +64,4 @@ python3 wifi_acces.py
 
 ## Contribuer
 
-Les issues et pull requests sont les bienvenues.
+Issues et pull requests bienvenues.
