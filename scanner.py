@@ -611,9 +611,9 @@ def build_devices(info: dict, arp: dict[str, dict], resolve_names: bool = False)
     status_order = {"en ligne": 0, "vu récemment": 1, "hors ligne": 2}
     devices.sort(
         key=lambda d: (
-            0 if d["known"] else 1,
-            order.get(d["role"], 9),
+            0 if not d["known"] else 1,
             status_order.get(d["status"], 9),
+            order.get(d["role"], 9),
             ip_sort_key(d["ip"]),
         )
     )
