@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
-"""Radar Wi-Fi — liste les appareils connectés au même réseau local."""
+"""Radar Wi-Fi — version navigateur."""
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import re
-import socket
-import subprocess
 import sys
 import threading
-import time
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import scanner
+
 HOST = "127.0.0.1"
 PORT = 8765
-OUI_PATH = Path("/usr/share/nmap/nmap-mac-prefixes")
-SAVE_PATH = Path(__file__).resolve().parent / "appareils_connus.json"
 
 lock = threading.Lock()
 state = {
@@ -31,280 +26,24 @@ state = {
     "devices": [],
     "info": {},
 }
-vendors: dict[str, str] = {}
-
-
-def run(cmd: list[str], timeout: float = 8) -> str:
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        return result.stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ""
-
-
-def load_vendors() -> dict[str, str]:
-    table: dict[str, str] = {}
-    if not OUI_PATH.exists():
-        return table
-    for line in OUI_PATH.read_text(errors="ignore").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(None, 1)
-        if len(parts) == 2 and re.fullmatch(r"[0-9A-Fa-f]{6,10}", parts[0]):
-            table[parts[0].upper()] = parts[1].strip()
-    return table
-
-
-def vendor_of(mac: str) -> str:
-    clean = mac.replace(":", "").replace("-", "").upper()
-    for size in (10, 8, 6):
-        if clean[:size] in vendors:
-            return vendors[clean[:size]]
-    return "Marque inconnue"
-
-
-def load_names() -> dict[str, str]:
-    if not SAVE_PATH.exists():
-        return {}
-    try:
-        data = json.loads(SAVE_PATH.read_text())
-        return {k.lower(): v for k, v in data.items() if isinstance(v, str)}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_name(mac: str, name: str) -> None:
-    names = load_names()
-    key = mac.lower()
-    name = name.strip()
-    if name:
-        names[key] = name
-    else:
-        names.pop(key, None)
-    SAVE_PATH.write_text(json.dumps(names, ensure_ascii=False, indent=2))
-
-
-def wifi_info() -> dict:
-    info = {
-        "ssid": "Wi-Fi",
-        "iface": "",
-        "ip": "",
-        "cidr": "",
-        "gateway": "",
-        "mac": "",
-        "hostname": socket.gethostname(),
-        "network": "",
-        "host_count": 0,
-    }
-
-    for line in run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"]).splitlines():
-        parts = line.split(":")
-        if len(parts) >= 4 and parts[1] == "wifi" and "connect" in parts[2]:
-            info["iface"] = parts[0]
-            info["ssid"] = parts[3] or info["ssid"]
-            break
-
-    if not info["iface"]:
-        for line in run(["ip", "-4", "route", "show", "default"]).splitlines():
-            match = re.search(r"dev (\S+)", line)
-            if match and match.group(1) not in {"lo", "docker0"}:
-                info["iface"] = match.group(1)
-                break
-
-    iface = info["iface"]
-    for line in run(["ip", "-4", "route"]).splitlines():
-        if line.startswith("default") and iface and f"dev {iface}" in line:
-            gw = re.search(r"via (\d+\.\d+\.\d+\.\d+)", line)
-            if gw:
-                info["gateway"] = gw.group(1)
-        elif iface and f"dev {iface}" in line and "proto kernel" in line:
-            match = re.search(r"(\d+\.\d+\.\d+\.\d+/\d+)", line)
-            src = re.search(r"src (\d+\.\d+\.\d+\.\d+)", line)
-            if match:
-                info["cidr"] = match.group(1)
-            if src:
-                info["ip"] = src.group(1)
-
-    if iface:
-        link = run(["ip", "-o", "link", "show", iface])
-        mac = re.search(r"link/ether ([0-9a-f:]{17})", link, re.I)
-        if mac:
-            info["mac"] = mac.group(1).lower()
-
-    if info["cidr"]:
-        net = ipaddress.IPv4Network(info["cidr"], strict=False)
-        info["network"] = str(net)
-        info["host_count"] = net.num_addresses - 2
-
-    return info
-
-
-def probe(ip: str) -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setblocking(False)
-    try:
-        sock.sendto(b"\x00", (ip, 5353))
-    except OSError:
-        pass
-    finally:
-        sock.close()
-
-
-def parse_arp(iface: str) -> dict[str, dict]:
-    found: dict[str, dict] = {}
-    output = run(["ip", "neigh", "show"])
-    for line in output.splitlines():
-        if iface and f"dev {iface}" not in line:
-            continue
-        ip_match = re.match(r"(\d+\.\d+\.\d+\.\d+)", line)
-        mac_match = re.search(r"lladdr ([0-9a-f:]{17})", line, re.I)
-        if not ip_match or not mac_match:
-            continue
-        status = "hors ligne"
-        if any(flag in line for flag in ("REACHABLE", "DELAY", "PROBE", "PERMANENT")):
-            status = "en ligne"
-        elif "STALE" in line:
-            status = "vu récemment"
-        else:
-            continue
-        ip = ip_match.group(1)
-        found[ip] = {
-            "ip": ip,
-            "mac": mac_match.group(1).lower(),
-            "status": status,
-        }
-    return found
-
-
-def hostname_of(ip: str) -> str:
-    result = [""]
-
-    def lookup() -> None:
-        try:
-            name = socket.getnameinfo((ip, 0), socket.NI_NAMEREQD)[0]
-            if name and name != ip:
-                result[0] = name.split(".")[0]
-        except OSError:
-            pass
-
-    worker = threading.Thread(target=lookup, daemon=True)
-    worker.start()
-    worker.join(0.2)
-    return result[0]
-
-
-def build_devices(info: dict, arp: dict[str, dict], resolve_names: bool = False) -> list[dict]:
-    names = load_names()
-    devices = []
-    arp = dict(arp)
-
-    if info.get("ip") and info.get("mac"):
-        arp[info["ip"]] = {
-            "ip": info["ip"],
-            "mac": info["mac"],
-            "status": "en ligne",
-        }
-
-    hosts: dict[str, str] = {}
-    if resolve_names:
-        with ThreadPoolExecutor(max_workers=24) as pool:
-            futures = {pool.submit(hostname_of, ip): ip for ip in arp}
-            for future in as_completed(futures):
-                ip = futures[future]
-                try:
-                    hosts[ip] = future.result() or ""
-                except Exception:
-                    hosts[ip] = ""
-
-    for ip, row in arp.items():
-        mac = row["mac"]
-        role = "appareil"
-        label = names.get(mac, "")
-        if ip == info.get("gateway"):
-            role = "box"
-            label = label or "Box / routeur"
-        elif ip == info.get("ip"):
-            role = "toi"
-            label = label or f"Cet ordinateur ({info.get('hostname') or 'toi'})"
-        host = hosts.get(ip, "")
-        devices.append(
-            {
-                "ip": ip,
-                "mac": mac,
-                "status": row["status"],
-                "vendor": vendor_of(mac),
-                "hostname": host,
-                "name": label,
-                "role": role,
-            }
-        )
-
-    order = {"toi": 0, "box": 1, "appareil": 2}
-    status_order = {"en ligne": 0, "vu récemment": 1, "hors ligne": 2}
-    devices.sort(
-        key=lambda d: (
-            order.get(d["role"], 9),
-            status_order.get(d["status"], 9),
-            tuple(int(x) for x in d["ip"].split(".")),
-        )
-    )
-    return devices
 
 
 def scan_network() -> None:
-    info = wifi_info()
-    with lock:
-        state["scanning"] = True
-        state["progress"] = 2
-        state["message"] = "Lecture des appareils déjà vus…"
-        state["info"] = info
-
-    if not info.get("cidr") or not info.get("iface"):
+    def on_progress(data: dict) -> None:
         with lock:
-            state["scanning"] = False
-            state["progress"] = 0
-            state["message"] = "Impossible de trouver le Wi-Fi."
-            state["devices"] = []
-        return
+            state["scanning"] = True
+            state["progress"] = data.get("progress", 0)
+            state["message"] = data.get("message", "")
+            state["devices"] = list(data.get("devices") or [])
+            state["info"] = dict(data.get("info") or {})
 
-    arp = parse_arp(info["iface"])
+    result = scanner.scan_network(on_progress)
     with lock:
-        state["devices"] = build_devices(info, arp, resolve_names=False)
-        state["progress"] = 8
-        state["message"] = "Recherche des autres appareils…"
-
-    net = ipaddress.IPv4Network(info["cidr"], strict=False)
-    targets = [str(ip) for ip in net.hosts() if str(ip) != info.get("ip")]
-    total = max(len(targets), 1)
-    done = 0
-
-    with ThreadPoolExecutor(max_workers=256) as pool:
-        futures = [pool.submit(probe, ip) for ip in targets]
-        for future in as_completed(futures):
-            future.result()
-            done += 1
-            if done % 80 == 0 or done == total:
-                with lock:
-                    state["progress"] = 8 + int(done / total * 80)
-                    state["message"] = f"Scan du réseau… {done}/{total}"
-
-    time.sleep(1.2)
-    arp = parse_arp(info["iface"])
-    devices = build_devices(info, arp, resolve_names=True)
-
-    with lock:
-        state["devices"] = devices
-        state["progress"] = 100
-        state["message"] = f"{len(devices)} appareil(s) trouvé(s)"
         state["scanning"] = False
-        state["info"] = info
+        state["progress"] = result.get("progress", 100)
+        state["message"] = result.get("message", "")
+        state["devices"] = list(result.get("devices") or [])
+        state["info"] = dict(result.get("info") or {})
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -574,11 +313,11 @@ class Handler(BaseHTTPRequestHandler):
             mac = str(payload.get("mac", "")).lower()
             name = str(payload.get("name", ""))
             if re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac):
-                save_name(mac, name)
+                scanner.save_name(mac, name)
                 with lock:
-                    info = state["info"] or wifi_info()
-                    arp = parse_arp(info.get("iface", ""))
-                    state["devices"] = build_devices(info, arp, resolve_names=False)
+                    info = state["info"] or scanner.wifi_info()
+                    arp = scanner.parse_arp(info.get("iface", ""))
+                    state["devices"] = scanner.build_devices(info, arp, resolve_names=False)
                 self._json({"ok": True})
                 return
             self._json({"ok": False}, 400)
@@ -588,12 +327,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global vendors
-    vendors = load_vendors()
-    info = wifi_info()
+    scanner.vendors = scanner.load_vendors()
+    info = scanner.wifi_info()
     with lock:
         state["info"] = info
-        state["devices"] = build_devices(info, parse_arp(info.get("iface", "")), resolve_names=False)
+        state["devices"] = scanner.build_devices(info, scanner.parse_arp(info.get("iface", "")), resolve_names=False)
         state["message"] = "Clique sur Scanner le Wi-Fi pour voir tout le monde."
 
     httpd = None
