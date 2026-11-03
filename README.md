@@ -46,8 +46,8 @@ sudo dnf install python3 python3-gobject gtk3 NetworkManager git
 
 ## Comment l’utiliser
 
-1. Clique **Scanner le Wi-Fi**
-2. Tu vois les appareils : **TOI**, **BOX**, et les **INCONNUS** (souvent les voisins)
+1. Clique **Scanner le Wi-Fi** — ça parcourt **tout** le réseau, pas seulement ton sous-réseau
+2. Tu vois les appareils : **TOI**, **BOX**, et les **INCONNUS**, avec type (téléphone, PC, TV…), marque et système
 3. **Nommer** : ex. « téléphone de maman »
 4. **Bloquer** : copie l’adresse MAC et ouvre la box pour le mettre en liste noire
 5. **Virer tout le monde** : ouvre la box, change le **mot de passe Wi-Fi**, donne le nouveau code seulement à la famille

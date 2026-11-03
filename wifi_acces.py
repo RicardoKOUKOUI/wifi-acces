@@ -142,7 +142,17 @@ class DeviceRow(Gtk.ListBoxRow):
         extra = device.get("hostname") if device.get("name") and device.get("hostname") else ""
         meta = Gtk.Label(
             label=" · ".join(
-                part for part in (device["status"], extra, device["vendor"], device["ip"], device["mac"]) if part
+                part
+                for part in (
+                    device.get("kind"),
+                    device.get("brand") or device.get("vendor"),
+                    device.get("system"),
+                    device["status"],
+                    extra,
+                    device["ip"],
+                    device["mac"],
+                )
+                if part
             )
         )
         meta.get_style_context().add_class("meta")
@@ -161,6 +171,9 @@ class DeviceRow(Gtk.ListBoxRow):
             tag.get_style_context().add_class("tag")
             right.pack_start(tag, False, False, 0)
         else:
+            kind_tag = Gtk.Label(label=(device.get("kind") or "Appareil").upper())
+            kind_tag.get_style_context().add_class("tag")
+            right.pack_start(kind_tag, False, False, 0)
             if not device.get("known"):
                 tag = Gtk.Label(label="INCONNU")
                 tag.get_style_context().add_class("tag")
@@ -344,9 +357,8 @@ class AppWindow(Gtk.ApplicationWindow):
 
         if self.info.get("shared"):
             self.warn.set_text(
-                "Ce Wi-Fi ressemble à un réseau partagé (opérateur / immeuble). "
-                "Tu peux voir des appareils qui ne sont pas chez toi. "
-                "Le scan se limite à ton voisinage immédiat."
+                f"Réseau large ({self.info.get('network')}) : le scan couvre TOUTES les adresses, "
+                "sans exception. Sur un Wi-Fi d’opérateur tu peux aussi voir des voisins."
             )
         else:
             self.warn.set_text("")

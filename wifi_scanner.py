@@ -205,11 +205,11 @@ PAGE = r"""<!DOCTYPE html>
           <div class="dot ${klass}"></div>
           <div>
             <div class="name">${title}</div>
-            <div class="meta">${esc(d.status)}${extra}</div>
+            <div class="meta">${esc([d.kind, d.brand || d.vendor, d.system, d.status].filter(Boolean).join(" · "))}${extra}</div>
           </div>
           <div class="ip">${esc(d.ip)}</div>
           <div class="mac">${esc(d.mac)}</div>
-          <div class="vendor">${esc(d.vendor)}</div>
+          <div class="vendor">${esc(d.kind || "")} · ${esc(d.brand || d.vendor)}</div>
           ${tag ? `<div class="tag">${tag}</div>` : `<button class="rename" onclick="renameMac('${esc(d.mac)}')">Nommer</button>`}
         </div>`;
       }).join("") || `<div class="card">Aucun appareil pour l’instant. Lance un scan.</div>`;

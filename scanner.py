@@ -28,7 +28,7 @@ def run(cmd: list[str], timeout: float = 8) -> str:
             timeout=timeout,
             check=False,
         )
-        return result.stdout
+        return result.stdout or ""
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
 
@@ -128,14 +128,167 @@ def wifi_info() -> dict:
     if info["cidr"]:
         net = ipaddress.IPv4Network(info["cidr"], strict=False)
         info["network"] = str(net)
+        info["scan_network"] = str(net)
         info["host_count"] = max(net.num_addresses - 2, 0)
-        if net.prefixlen < 24 and info["ip"]:
-            local = ipaddress.IPv4Network(f"{info['ip']}/24", strict=False)
-            info["scan_network"] = str(local)
-            info["shared"] = True
-        else:
-            info["scan_network"] = str(net)
+        info["shared"] = net.prefixlen < 24
     return info
+
+
+def mac_randomized(mac: str) -> bool:
+    try:
+        return bool(int(mac.split(":")[0], 16) & 0x02)
+    except (ValueError, IndexError):
+        return False
+
+
+def classify_device(vendor: str, hostname: str, role: str, ttl: int | None, mac: str) -> tuple[str, str, str]:
+    brand = vendor if vendor and vendor != "Marque inconnue" else ""
+    blob = f"{vendor} {hostname}".lower()
+    kind = "Appareil"
+    system = ""
+
+    if ttl is not None:
+        if ttl <= 64:
+            system = "Linux / Android / Apple"
+        elif ttl <= 128:
+            system = "Windows"
+        else:
+            system = "Équipement réseau"
+
+    def has(*words: str) -> bool:
+        return any(word in blob for word in words)
+
+    if role == "box" or has("routeur", "router", "gateway", "box"):
+        kind = "Box / routeur"
+        system = system or "Équipement réseau"
+    elif has("iphone"):
+        kind, brand, system = "Téléphone", brand or "Apple", "iPhone / iOS"
+    elif has("ipad"):
+        kind, brand, system = "Tablette", brand or "Apple", "iPadOS"
+    elif has("macbook", "imac", "mac-mini", "mac mini"):
+        kind, brand, system = "PC", brand or "Apple", "macOS"
+    elif has(
+        "android", "galaxy", "pixel", "redmi", "poco", "xiaomi", "honor",
+        "oppo", "vivo", "oneplus", "realme", "tecno", "infinix", "motorola",
+        "nokia", "smartphone", "sm-", "phone",
+    ):
+        kind = "Téléphone"
+        if has("samsung", "galaxy", "sm-"):
+            brand = brand or "Samsung"
+            system = "Android"
+        elif has("xiaomi", "redmi", "poco"):
+            brand = brand or "Xiaomi"
+            system = "Android"
+        elif has("pixel", "google"):
+            brand = brand or "Google"
+            system = "Android"
+        else:
+            system = "Android"
+    elif has("tablet", "tab "):
+        kind = "Tablette"
+    elif has("playstation", "xbox", "nintendo", "switch"):
+        kind = "Console"
+    elif has("bravia", "chromecast", "roku", "firetv", "fire-tv", "smart-tv", "webos", "hisense"):
+        kind = "TV"
+    elif has("printer", "imprim", "canon", "epson", "brother", "xerox", "deskjet", "laserjet"):
+        kind = "Imprimante"
+    elif has("tp-link", "netgear", "cisco", "mikrotik", "ubiquiti", "zyxel", "sagem", "arcadyan", "technicolor"):
+        kind = "Box / routeur"
+    elif has("espressif", "esp32", "tuya", "shelly", "sonoff", "echo", "nest", "ring"):
+        kind = "Objet connecté"
+    elif has(
+        "intel", "dell", "lenovo", "hewlett", "hp inc", "asus", "acer", "msi",
+        "gigabyte", "realtek", "azurewave", "liteon", "hon hai", "foxconn",
+        "thinkpad", "latitude", "optiplex", "desktop", "laptop", "windows",
+    ):
+        kind = "PC"
+        if "windows" in blob or (ttl is not None and 100 <= ttl <= 128):
+            system = "Windows"
+    elif "apple" in blob:
+        kind = "Appareil Apple"
+        brand = brand or "Apple"
+        system = system or "Apple"
+    elif mac_randomized(mac) and role != "box":
+        kind = "Téléphone"
+        brand = brand or "Marque masquée"
+        system = system or "Android / iPhone (MAC aléatoire)"
+
+    if not brand:
+        brand = "Marque inconnue" if not mac_randomized(mac) else "Marque masquée (MAC aléatoire)"
+    return kind, brand, system
+
+
+def ping_ttl(ip: str) -> int | None:
+    output = run(["ping", "-c", "1", "-W", "1", ip], timeout=2)
+    match = re.search(r"ttl[=:](\d+)", output, re.I)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def mdns_names() -> dict[str, str]:
+    names: dict[str, str] = {}
+    output = run(["avahi-browse", "-a", "-t", "-p", "-l"], timeout=10)
+    for line in output.splitlines():
+        parts = line.split(";")
+        if len(parts) < 8:
+            continue
+        host = parts[6].strip().strip(".")
+        addr = parts[7].strip()
+        if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", addr) and host:
+            names[addr] = host.split(".")[0]
+    return names
+
+
+def nmap_hosts(network: str) -> dict[str, dict]:
+    found: dict[str, dict] = {}
+    xml = run(
+        [
+            "nmap",
+            "-sn",
+            "-n",
+            "-T5",
+            "--max-retries",
+            "1",
+            "--host-timeout",
+            "800ms",
+            "--min-rate",
+            "2000",
+            "-oX",
+            "-",
+            network,
+        ],
+        timeout=90,
+    )
+    if not xml.strip():
+        return found
+    for block in re.findall(r"<host\b.*?</host>", xml, re.S):
+        if 'state="up"' not in block:
+            continue
+        ip_match = re.search(r'addr="(\d+\.\d+\.\d+\.\d+)" addrtype="ipv4"', block)
+        mac_match = re.search(r'addr="([0-9A-Fa-f:]{17})" addrtype="mac"', block)
+        vendor_match = re.search(r'addrtype="mac"[^>]*vendor="([^"]*)"', block)
+        if not ip_match:
+            continue
+        ip = ip_match.group(1)
+        mac = mac_match.group(1).lower() if mac_match else ""
+        if not mac:
+            continue
+        vendor = vendor_match.group(1) if vendor_match else ""
+        found[ip] = {"ip": ip, "mac": mac, "status": "en ligne", "nmap_vendor": vendor}
+    return found
+
+
+def ping_sweep(ips: list[str], on_tick=None) -> None:
+    total = max(len(ips), 1)
+    done = 0
+    with ThreadPoolExecutor(max_workers=400) as pool:
+        futures = [pool.submit(run, ["ping", "-c", "1", "-W", "1", ip], 1.5) for ip in ips]
+        for future in as_completed(futures):
+            future.result()
+            done += 1
+            if on_tick and (done % 250 == 0 or done == total):
+                on_tick(done, total)
 
 
 def probe(ip: str) -> None:
@@ -143,6 +296,8 @@ def probe(ip: str) -> None:
     sock.setblocking(False)
     try:
         sock.sendto(b"\x00", (ip, 5353))
+        sock.sendto(b"\x00", (ip, 137))
+        sock.sendto(b"\x00", (ip, 1900))
     except OSError:
         pass
     finally:
@@ -204,16 +359,24 @@ def build_devices(info: dict, arp: dict[str, dict], resolve_names: bool = False)
             "status": "en ligne",
         }
 
-    hosts: dict[str, str] = {}
+    hosts: dict[str, str] = dict(info.get("mdns") or {})
+    ttls: dict[str, int | None] = {}
     if resolve_names:
-        with ThreadPoolExecutor(max_workers=24) as pool:
-            futures = {pool.submit(hostname_of, ip): ip for ip in arp}
-            for future in as_completed(futures):
-                ip = futures[future]
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            host_futs = {pool.submit(hostname_of, ip): ip for ip in arp}
+            ttl_futs = {pool.submit(ping_ttl, ip): ip for ip in arp}
+            for future in as_completed(host_futs):
+                ip = host_futs[future]
                 try:
-                    hosts[ip] = future.result() or ""
+                    hosts[ip] = future.result() or hosts.get(ip, "")
                 except Exception:
-                    hosts[ip] = ""
+                    hosts.setdefault(ip, "")
+            for future in as_completed(ttl_futs):
+                ip = ttl_futs[future]
+                try:
+                    ttls[ip] = future.result()
+                except Exception:
+                    ttls[ip] = None
 
     for ip, row in arp.items():
         mac = row["mac"]
@@ -226,13 +389,21 @@ def build_devices(info: dict, arp: dict[str, dict], resolve_names: bool = False)
             role = "toi"
             label = label or f"Cet ordinateur ({info.get('hostname') or 'toi'})"
         host = hosts.get(ip, "")
+        vendor = row.get("nmap_vendor") or vendor_of(mac)
+        kind, brand, system = classify_device(vendor, host or label, role, ttls.get(ip), mac)
+        if role == "toi":
+            kind = "PC"
+            brand = brand if brand != "Marque inconnue" else vendor_of(mac)
         known = bool(label) or role in {"toi", "box"}
         devices.append(
             {
                 "ip": ip,
                 "mac": mac,
                 "status": row["status"],
-                "vendor": vendor_of(mac),
+                "vendor": vendor,
+                "brand": brand,
+                "kind": kind,
+                "system": system,
                 "hostname": host,
                 "name": label,
                 "role": role,
@@ -295,23 +466,47 @@ def scan_network(on_progress=None) -> dict:
             on_progress(result)
         return result
 
-    arp = parse_arp(info["iface"])
-    devices = build_devices(info, arp, resolve_names=False)
-    progress(8, "Recherche des autres appareils…", info, devices)
+    seen = parse_arp(info["iface"])
+    devices = build_devices(info, seen, resolve_names=False)
+    progress(6, f"Scan complet de {info.get('network')} ({info.get('host_count')} adresses)…", info, devices)
+
+    network = info.get("scan_network") or info.get("cidr")
+    nmap_found: dict[str, dict] = {}
+    if network:
+        progress(12, "Découverte de tous les appareils (nmap)…", info, devices)
+        nmap_found = nmap_hosts(network)
+        progress(40, f"{len(nmap_found)} hôte(s) nmap, ping de tout le réseau…", info, devices)
 
     targets = scan_targets(info)
     total = max(len(targets), 1)
+
+    def ping_tick(done: int, all_count: int) -> None:
+        progress(40 + int(done / all_count * 20), f"Ping de toutes les IP… {done}/{all_count}", info, devices)
+
+    ping_sweep(targets, ping_tick)
     done = 0
-    with ThreadPoolExecutor(max_workers=128) as pool:
+    with ThreadPoolExecutor(max_workers=256) as pool:
         futures = [pool.submit(probe, ip) for ip in targets]
         for future in as_completed(futures):
             future.result()
             done += 1
-            if done % 40 == 0 or done == total:
-                progress(8 + int(done / total * 80), f"Scan du réseau… {done}/{total}", info, devices)
+            if done % 200 == 0 or done == total:
+                progress(60 + int(done / total * 20), f"Scan de toutes les IP… {done}/{total}", info, devices)
 
-    time.sleep(1.0)
-    arp = parse_arp(info["iface"])
+    time.sleep(1.4)
+    arp = dict(seen)
+    fresh = parse_arp(info["iface"])
+    for ip, row in fresh.items():
+        arp[ip] = row
+    for ip, row in nmap_found.items():
+        if ip not in arp:
+            arp[ip] = row
+        else:
+            arp[ip]["status"] = "en ligne"
+            if row.get("nmap_vendor"):
+                arp[ip]["nmap_vendor"] = row["nmap_vendor"]
+    info["mdns"] = mdns_names()
+    progress(88, "Identification (téléphone, PC, marque)…", info, build_devices(info, arp, False))
     devices = build_devices(info, arp, resolve_names=True)
     online = sum(1 for d in devices if d["status"] == "en ligne")
     unknown = sum(1 for d in devices if not d["known"])
