@@ -19,74 +19,94 @@ import scanner
 ROOT = Path(__file__).resolve().parent
 CSS = b"""
 window {
-  background-color: #0b1018;
+  background-color: #0a1018;
   color: #eef3fb;
-  font-family: "Inter", "Noto Sans", "Segoe UI", sans-serif;
 }
 headerbar {
-  background-color: #101722;
+  background-image: none;
+  background-color: #101822;
   color: #eef3fb;
   border-bottom: 1px solid #243044;
-  min-height: 52px;
+  min-height: 54px;
+  padding: 6px 10px;
 }
-headerbar label {
-  color: #eef3fb;
+headerbar label { color: #eef3fb; }
+box.hero {
+  background-color: #121b28;
+  border: 1px solid #2a3c55;
+  border-radius: 22px;
+  padding: 20px 22px;
 }
-.hero {
-  background-color: #121a26;
-  border: 1px solid #243044;
-  border-radius: 20px;
-  padding: 18px 20px;
+label.total-label { color: #8fa6c0; }
+label.ssid { color: #d7e6ff; }
+label.muted { color: #8fa3bb; }
+box.card {
+  background-color: #151e2c;
+  border: 1px solid #2a3c55;
+  border-radius: 18px;
+  padding: 14px 16px;
 }
-.total-label { color: #9cb0c9; font-size: 13px; letter-spacing: 1.4px; }
-.total-value { color: #5ee0c0; font-size: 42px; font-weight: 800; }
-.ssid { color: #d7e6ff; font-weight: 700; font-size: 16px; }
-.muted { color: #8fa3bb; }
-.card {
-  background-color: #151d2b;
-  border: 1px solid #243044;
-  border-radius: 16px;
-  padding: 12px 14px;
-}
-.stat-label { color: #8fa3bb; font-size: 11px; letter-spacing: .08em; }
-.stat-value { font-size: 22px; font-weight: 800; color: #f4f7fb; }
-.stat-unknown .stat-value { color: #f0c14b; }
-.stat-online .stat-value { color: #3ddc97; }
-button.suggested-action {
-  background: #5ee0c0;
-  color: #07241d;
-  font-weight: 800;
+label.stat-label { color: #8fa3bb; }
+button {
+  min-height: 34px;
+  padding: 8px 14px;
   border-radius: 999px;
-  padding: 10px 16px;
+}
+button.suggested-action {
+  background-image: none;
+  background-color: #5ee0c0;
+  color: #06241c;
+  font-weight: 800;
   border: 0;
 }
 button.flat-ghost {
-  background: #1b2535;
+  background-image: none;
+  background-color: #1b2636;
   color: #eef3fb;
-  border-radius: 999px;
-  padding: 10px 16px;
-  border: 1px solid #2b3b52;
+  border: 1px solid #334863;
 }
 button.danger {
-  background: #d45b4a;
+  background-image: none;
+  background-color: #d45b4a;
   color: #fff8f6;
   font-weight: 800;
-  border-radius: 999px;
-  padding: 10px 16px;
   border: 0;
 }
-.hint { color: #8fa3bb; font-size: 13px; }
-scrolledwindow, treeview {
-  background-color: #101722;
-  color: #e8eef8;
+label.hint { color: #8fa3bb; }
+scrolledwindow {
+  background-color: #101822;
+  border: 1px solid #2a3c55;
   border-radius: 16px;
 }
 treeview {
-  font-size: 13px;
+  background-color: #101822;
+  color: #e8eef8;
 }
-treeview:selected {
+treeview.view {
+  background-color: #101822;
+  color: #e8eef8;
+}
+treeview.view:selected {
   background-color: #1b3d38;
   color: #ffffff;
+}
+treeview header button {
+  background-image: none;
+  background-color: #151e2c;
+  color: #9cb0c9;
+  border: 0;
+  border-radius: 0;
+  min-height: 36px;
+}
+progressbar trough {
+  background-color: #1b2636;
+  border-radius: 999px;
+  min-height: 10px;
+}
+progressbar progress {
+  background-image: none;
+  background-color: #5ee0c0;
+  border-radius: 999px;
 }
 """
 
@@ -134,7 +154,7 @@ class AppWindow(Gtk.ApplicationWindow):
         self.selected: dict | None = None
 
         header = Gtk.HeaderBar()
-        header.set_show_close_button(True)
+        header.set_show_close_button(False)
         header.set_title("Wi-Fi Accès")
         header.set_subtitle("Tous les appareils, y compris les inconnus")
         self.set_titlebar(header)
@@ -176,15 +196,17 @@ class AppWindow(Gtk.ApplicationWindow):
         total_caption = Gtk.Label(label="TOTAL APPAREILS")
         total_caption.get_style_context().add_class("total-label")
         total_caption.set_xalign(0)
-        self.total_value = Gtk.Label(label="0")
-        self.total_value.get_style_context().add_class("total-value")
+        self.total_value = Gtk.Label()
+        self.total_value.set_markup('<span size="42000" weight="ultrabold" foreground="#5ee0c0">0</span>')
         self.total_value.set_xalign(0)
+        self.total_value.set_use_markup(True)
         total_box.pack_start(total_caption, False, False, 0)
         total_box.pack_start(self.total_value, False, False, 0)
         right_hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        self.ssid = Gtk.Label(label="Réseau : …")
-        self.ssid.get_style_context().add_class("ssid")
+        self.ssid = Gtk.Label()
+        self.ssid.set_markup('<span size="15000" weight="bold" foreground="#d7e6ff">Réseau : …</span>')
         self.ssid.set_xalign(0)
+        self.ssid.set_use_markup(True)
         self.breakdown = Gtk.Label(label="Inconnus, téléphones, PC, box : 0")
         self.breakdown.get_style_context().add_class("muted")
         self.breakdown.set_xalign(0)
@@ -196,8 +218,8 @@ class AppWindow(Gtk.ApplicationWindow):
         root.pack_start(hero, False, False, 0)
 
         stats = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        self.stat_unknown = self._stat_card("Inconnus", "0", "stat-unknown")
-        self.stat_online = self._stat_card("En ligne", "0", "stat-online")
+        self.stat_unknown = self._stat_card("Inconnus", "0", "stat-unknown", "#f0c14b")
+        self.stat_online = self._stat_card("En ligne", "0", "stat-online", "#3ddc97")
         self.stat_phones = self._stat_card("Téléphones", "0")
         self.stat_pc = self._stat_card("PC", "0")
         for card in (self.stat_unknown, self.stat_online, self.stat_phones, self.stat_pc):
@@ -266,7 +288,7 @@ class AppWindow(Gtk.ApplicationWindow):
         self.connect("key-press-event", self.on_key)
         self.refresh_snapshot()
 
-    def _stat_card(self, title: str, value: str, extra: str = "") -> Gtk.Box:
+    def _stat_card(self, title: str, value: str, extra: str = "", color: str = "#f4f7fb") -> Gtk.Box:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         box.get_style_context().add_class("card")
         if extra:
@@ -274,9 +296,13 @@ class AppWindow(Gtk.ApplicationWindow):
         label = Gtk.Label(label=title.upper())
         label.get_style_context().add_class("stat-label")
         label.set_xalign(0)
-        val = Gtk.Label(label=value)
-        val.get_style_context().add_class("stat-value")
+        val = Gtk.Label()
+        val.set_use_markup(True)
         val.set_xalign(0)
+        val.stat_color = color  # type: ignore[attr-defined]
+        val.set_markup(
+            f'<span size="22000" weight="ultrabold" foreground="{color}">{value}</span>'
+        )
         box.pack_start(label, False, False, 0)
         box.pack_start(val, False, False, 0)
         box.value_label = val  # type: ignore[attr-defined]
@@ -289,7 +315,9 @@ class AppWindow(Gtk.ApplicationWindow):
         return False
 
     def set_stat(self, card: Gtk.Box, value: str) -> None:
-        card.value_label.set_text(value)  # type: ignore[attr-defined]
+        label = card.value_label  # type: ignore[attr-defined]
+        color = getattr(label, "stat_color", "#f4f7fb")
+        label.set_markup(f'<span size="22000" weight="ultrabold" foreground="{color}">{value}</span>')
 
     def refresh_snapshot(self) -> None:
         if self.scanning:
@@ -316,8 +344,12 @@ class AppWindow(Gtk.ApplicationWindow):
         unknown = sum(1 for d in self.devices if not d.get("known"))
         phones = sum(1 for d in self.devices if "éléphone" in (d.get("kind") or ""))
         pcs = sum(1 for d in self.devices if (d.get("kind") or "") == "PC")
-        self.total_value.set_text(str(total))
-        self.ssid.set_text(f"Réseau : {ssid}")
+        self.total_value.set_markup(
+            f'<span size="42000" weight="ultrabold" foreground="#5ee0c0">{total}</span>'
+        )
+        self.ssid.set_markup(
+            f'<span size="15000" weight="bold" foreground="#d7e6ff">Réseau : {GLib.markup_escape_text(ssid)}</span>'
+        )
         self.breakdown.set_text(
             f"{unknown} inconnus  ·  {online} en ligne  ·  {phones} téléphones  ·  {pcs} PC  ·  {total} au total"
         )
@@ -356,6 +388,8 @@ class AppWindow(Gtk.ApplicationWindow):
                     device.get("role") or "",
                 ]
             )
+        if len(self.devices) > 0:
+            self.tree.scroll_to_cell(Gtk.TreePath.new_first())
 
     def on_select(self, selection) -> None:
         model, tree_iter = selection.get_selected()
