@@ -304,25 +304,121 @@ def nmap_hosts_privileged(network: str) -> dict[str, dict]:
     return parse_nmap_xml(xml)
 
 
-def ping_sweep(ips: list[str], on_tick=None) -> None:
-    total = max(len(ips), 1)
-    done = 0
-    with ThreadPoolExecutor(max_workers=400) as pool:
-        futures = [pool.submit(run, ["ping", "-c", "1", "-W", "1", ip], 1.5) for ip in ips]
-        for future in as_completed(futures):
-            future.result()
-            done += 1
-            if on_tick and (done % 250 == 0 or done == total):
-                on_tick(done, total)
+UDP_PORTS = (53, 67, 123, 137, 138, 161, 500, 1900, 5353, 5355, 33434, 17500, 3702)
+TCP_PORTS = (80, 443, 8080, 8443, 62078, 5555, 445, 139, 22, 5000)
+
+
+def ingest_neigh_line(line: str, iface: str, into: dict[str, dict], lock: threading.Lock) -> None:
+    if "Deleted" in line or "FAILED" in line:
+        return
+    if iface and f"dev {iface}" not in line:
+        return
+    mac_match = re.search(r"lladdr ([0-9a-f:]{17})", line, re.I)
+    if not mac_match:
+        return
+    ipv4 = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
+    if ipv4:
+        ip = ipv4.group(1)
+    else:
+        first = re.match(r"(\S+)", line.strip())
+        ip = first.group(1) if first else ""
+        if not ip:
+            return
+    status = "en ligne" if any(x in line for x in ("REACHABLE", "DELAY", "PROBE", "PERMANENT")) else "vu récemment"
+    row = {"ip": ip, "mac": mac_match.group(1).lower(), "status": status}
+    with lock:
+        prev = into.get(ip)
+        if prev is None or (status == "en ligne" and prev.get("status") != "en ligne"):
+            into[ip] = row
+
+
+class NeighWatch:
+    def __init__(self, iface: str, into: dict[str, dict], lock: threading.Lock):
+        self.iface = iface
+        self.into = into
+        self.lock = lock
+        self.proc: subprocess.Popen | None = None
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(
+            ["ip", "monitor", "neigh"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self) -> None:
+        if not self.proc or not self.proc.stdout:
+            return
+        for line in self.proc.stdout:
+            ingest_neigh_line(line, self.iface, self.into, self.lock)
+
+    def stop(self) -> None:
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
 
 def probe(ip: str) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     try:
-        sock.sendto(b"\x00", (ip, 5353))
-        sock.sendto(b"\x00", (ip, 137))
-        sock.sendto(b"\x00", (ip, 1900))
+        payload = b"\x00"
+        for port in UDP_PORTS:
+            try:
+                sock.sendto(payload, (ip, port))
+            except OSError:
+                pass
+    finally:
+        sock.close()
+
+
+def tcp_poke(ip: str) -> None:
+    for port in TCP_PORTS:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.08)
+        try:
+            sock.connect((ip, port))
+        except OSError:
+            pass
+        finally:
+            sock.close()
+
+
+def ssdp_blast() -> None:
+    msg = (
+        'M-SEARCH * HTTP/1.1\r\n'
+        'HOST: 239.255.255.250:1900\r\n'
+        'MAN: "ssdp:discover"\r\n'
+        'MX: 1\r\n'
+        'ST: ssdp:all\r\n\r\n'
+    ).encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(0.4)
+    try:
+        sock.sendto(msg, ("239.255.255.250", 1900))
+        sock.sendto(msg, ("255.255.255.255", 1900))
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+
+def mdns_blast() -> None:
+    # PTR query for services, enough to wake mDNS stacks.
+    payload = bytes.fromhex("000000000001000000000000095f7365727669636573075f646e732d7364045f756470056c6f63616c00000c0001")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setblocking(False)
+    try:
+        sock.sendto(payload, ("224.0.0.251", 5353))
     except OSError:
         pass
     finally:
@@ -331,7 +427,7 @@ def probe(ip: str) -> None:
 
 def parse_arp(iface: str) -> dict[str, dict]:
     found: dict[str, dict] = {}
-    output = run(["ip", "neigh", "show"])
+    output = run(["ip", "neigh", "show", "nud", "all"])
     for line in output.splitlines():
         if iface and f"dev {iface}" not in line:
             continue
@@ -351,12 +447,21 @@ def parse_arp(iface: str) -> dict[str, dict]:
     return found
 
 
-def harvest_arp(into: dict[str, dict], iface: str) -> None:
+def harvest_arp(into: dict[str, dict], iface: str, lock: threading.Lock | None = None) -> None:
     rank = {"en ligne": 0, "vu récemment": 1, "hors ligne": 2}
-    for ip, row in parse_arp(iface).items():
-        prev = into.get(ip)
-        if prev is None or rank.get(row["status"], 9) <= rank.get(prev["status"], 9):
-            into[ip] = row
+    rows = parse_arp(iface)
+
+    def merge() -> None:
+        for ip, row in rows.items():
+            prev = into.get(ip)
+            if prev is None or rank.get(row["status"], 9) <= rank.get(prev["status"], 9):
+                into[ip] = row
+
+    if lock:
+        with lock:
+            merge()
+    else:
+        merge()
 
 
 def harvest_ipv6(into: dict[str, dict], iface: str) -> None:
@@ -451,9 +556,11 @@ def build_devices(info: dict, arp: dict[str, dict], resolve_names: bool = False)
     hosts: dict[str, str] = dict(info.get("mdns") or {})
     ttls: dict[str, int | None] = {}
     if resolve_names:
-        with ThreadPoolExecutor(max_workers=32) as pool:
+        with ThreadPoolExecutor(max_workers=48) as pool:
             host_futs = {pool.submit(hostname_of, ip): ip for ip in arp}
-            ttl_futs = {pool.submit(ping_ttl, ip): ip for ip in arp}
+            ttl_futs = {}
+            if len(arp) <= 120:
+                ttl_futs = {pool.submit(ping_ttl, ip): ip for ip in arp}
             for future in as_completed(host_futs):
                 ip = host_futs[future]
                 try:
@@ -507,10 +614,20 @@ def build_devices(info: dict, arp: dict[str, dict], resolve_names: bool = False)
             0 if d["known"] else 1,
             order.get(d["role"], 9),
             status_order.get(d["status"], 9),
-            tuple(int(x) for x in d["ip"].split(".")),
+            ip_sort_key(d["ip"]),
         )
     )
     return devices
+
+
+def ip_sort_key(ip: str) -> tuple:
+    try:
+        return (0, int(ipaddress.IPv4Address(ip)))
+    except Exception:
+        try:
+            return (1, int(ipaddress.IPv6Address(ip)))
+        except Exception:
+            return (2, 0)
 
 
 def scan_targets(info: dict) -> list[str]:
@@ -556,45 +673,77 @@ def scan_network(on_progress=None, deep: bool = False) -> dict:
         return result
 
     iface = info["iface"]
+    lock = threading.Lock()
     seen: dict[str, dict] = {}
-    harvest_arp(seen, iface)
+    harvest_arp(seen, iface, lock)
+    watch = NeighWatch(iface, seen, lock)
+    watch.start()
     devices = build_devices(info, seen, resolve_names=False)
-    progress(4, f"Scan de TOUT {info.get('network')} ({info.get('host_count')} adresses)…", info, devices)
+    progress(3, f"Scan profond de TOUT {info.get('network')} ({info.get('host_count')} IP)…", info, devices)
 
-    if info.get("cidr"):
-        net = ipaddress.IPv4Network(info["cidr"], strict=False)
-        run(["ping", "-b", "-c", "2", "-W", "1", str(net.broadcast_address)], timeout=4)
-        harvest_arp(seen, iface)
+    try:
+        if info.get("cidr"):
+            net = ipaddress.IPv4Network(info["cidr"], strict=False)
+            run(["ping", "-b", "-c", "3", "-W", "1", str(net.broadcast_address)], timeout=5)
+        ssdp_blast()
+        mdns_blast()
+        harvest_arp(seen, iface, lock)
 
-    targets = scan_targets(info)
-    total = max(len(targets), 1)
-    batch_size = 64
-    done = 0
-    for start in range(0, len(targets), batch_size):
-        batch = targets[start : start + batch_size]
-        with ThreadPoolExecutor(max_workers=64) as pool:
-            list(pool.map(probe, batch))
-            list(pool.map(lambda ip: run(["ping", "-c", "1", "-W", "1", ip], 1.6), batch))
-        harvest_arp(seen, iface)
-        done = min(start + batch_size, total)
-        pct = 6 + int(done / total * 78)
-        devices = build_devices(info, seen, resolve_names=False)
-        progress(pct, f"Scan de toutes les IP… {done}/{total} — {len(seen)} trouvé(s)", info, devices)
+        targets = scan_targets(info)
+        total = max(len(targets), 1)
+        network = info.get("scan_network") or info.get("cidr")
 
-    time.sleep(0.8)
-    harvest_arp(seen, iface)
-    harvest_ipv6(seen, iface)
-    network = info.get("scan_network") or info.get("cidr")
-    if deep and network:
-        progress(85, "Scan profond : entre le mot de passe Linux si demandé…", info, build_devices(info, seen, False))
-        extra = nmap_hosts_privileged(network)
-        for ip, row in extra.items():
-            seen[ip] = row
+        def snapshot(pct: int, message: str) -> None:
+            with lock:
+                current = dict(seen)
+            progress(pct, f"{message} — {len(current)} trouvé(s)", info, build_devices(info, current, False))
+
+        snapshot(6, "Réveil multicast / broadcast")
+
+        with ThreadPoolExecutor(max_workers=400) as pool:
+            done = 0
+            for _ in pool.map(probe, targets):
+                done += 1
+                if done % 200 == 0 or done == total:
+                    snapshot(6 + int(done / total * 25), f"UDP sur toutes les IP… {done}/{total}")
+
+        snapshot(32, "Deuxième passe UDP")
+        with ThreadPoolExecutor(max_workers=400) as pool:
+            list(pool.map(probe, targets))
+
+        if network:
+            snapshot(38, "fping de tout le réseau")
+            run(["fping", "-a", "-q", "-i", "1", "-r", "1", "-t", "80", "-g", network], timeout=45)
+
+        snapshot(48, "Connexions TCP (téléphones / PC)")
+        with ThreadPoolExecutor(max_workers=200) as pool:
+            done = 0
+            for _ in pool.map(tcp_poke, targets):
+                done += 1
+                if done % 250 == 0 or done == total:
+                    snapshot(48 + int(done / total * 22), f"TCP sur toutes les IP… {done}/{total}")
+
+        ssdp_blast()
+        mdns_blast()
+        harvest_ipv6(seen, iface)
+        time.sleep(1.2)
+        harvest_arp(seen, iface, lock)
+
+        if deep and network:
+            snapshot(84, "Scan root ARP : mot de passe Linux si demandé")
+            extra = nmap_hosts_privileged(network)
+            with lock:
+                for ip, row in extra.items():
+                    seen[ip] = row
+    finally:
+        watch.stop()
+
+    harvest_arp(seen, iface, lock)
     merge_history(seen)
     save_history(seen)
-    arp = seen
+    arp = dict(seen)
     info["mdns"] = mdns_names()
-    progress(88, f"Identification de {len(arp)} appareil(s)…", info, build_devices(info, arp, False))
+    progress(90, f"Identification de {len(arp)} appareil(s)…", info, build_devices(info, arp, False))
     devices = build_devices(info, arp, resolve_names=True)
     online = sum(1 for d in devices if d["status"] == "en ligne")
     unknown = sum(1 for d in devices if not d["known"])
